@@ -1,5 +1,5 @@
-import json
 from pathlib import Path
+import os
 
 import qrcode
 
@@ -7,13 +7,11 @@ import qrcode
 OUTPUT_DIR = Path("generated")
 
 
-def generate_qr(credential_package: dict, credential_id: str) -> str:
+def generate_qr(credential_id: str) -> str:
     OUTPUT_DIR.mkdir(exist_ok=True)
 
-    qr_data = json.dumps(
-        credential_package,
-        separators=(",", ":"),
-    )
+    base_url = os.getenv("VERICERT_PUBLIC_URL", "http://127.0.0.1:8000")
+    qr_data = f"{base_url.rstrip('/')}/verify/{credential_id}"
 
     image = qrcode.make(qr_data)
 

@@ -1,81 +1,59 @@
-from pathlib import Path
+from io import BytesIO
 
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.lib.units import mm
-from reportlab.platypus import (
-    SimpleDocTemplate,
-    Paragraph,
-    Spacer,
-    Image,
-)
+from pypdf import PdfReader, PdfWriter
+from reportlab.lib.utils import ImageReader
+from reportlab.pdfgen import canvas
 
-OUTPUT_DIR = Path("generated")
+from .storage import template_path
 
 
-def generate_certificate(package: dict, qr_path: str) -> str:
-    OUTPUT_DIR.mkdir(exist_ok=True)
+def _value_for(field: dict, credential: dict) -> str:
+    key = field["key"]
+    builtins = {
+        "credential_id": credential["credential_id"],
+        "issue_date": credential["issue_date"],
+        "club": credential["club"]["name"],
+        "event": credential["event"]["name"],
+    }
+    return str(builtins.get(key, credential["recipient"].get(key, "")))
 
-    credential = package["credential"]
-    credential_id = credential["credential_id"]
 
-    pdf_path = OUTPUT_DIR / f"{credential_id}.pdf"
-
-    document = SimpleDocTemplate(
-        str(pdf_path),
-        pagesize=A4,
-        rightMargin=25 * mm,
-        leftMargin=25 * mm,
-        topMargin=25 * mm,
-        bottomMargin=25 * mm,
-    )
-
-    styles = getSampleStyleSheet()
-
-    title = styles["Title"]
-    normal = styles["Normal"]
-
-    content = []
-
-    content.append(
-        Paragraph(
-            "DIGITAL ACADEMIC CERTIFICATE",
-            title,
-        )
-    )
-
-    content.append(Spacer(1, 15 * mm))
-
-    content.append(
-        Paragraph(
-            f"<b>This certifies that</b><br/><br/>"
-            f"<font size='18'><b>{credential['name']}</b></font><br/><br/>"
-            f"has successfully completed "
-            f"<b>{credential['qualification']}</b>.<br/><br/>"
-            f"Graduation Year: {credential['graduation_year']}<br/>"
-            f"CGPA: {credential['cgpa']}<br/>"
-            f"Issue Date: {credential['issue_date']}<br/><br/>"
-            f"Issuer: {credential['issuer']}<br/>"
-            f"Credential ID: {credential_id}",
-            normal,
-        )
-    )
-
-    content.append(Spacer(1, 15 * mm))
-
-    qr = Image(qr_path, width=45 * mm, height=45 * mm)
-
-    content.append(qr)
-
-    content.append(Spacer(1, 5 * mm))
-
-    content.append(
-        Paragraph(
-            "Scan the QR code to cryptographically verify this credential.",
-            normal,
-        )
-    )
-
-    document.build(content)
-
-    return str(pdf_path)
+def render_certificate(template, credential_package: dict, qr_path: str) -> bytes:
+    credential = credential_package["credential"]
+    width, height = template.page_width, template.page_height
+    overlay = BytesIO()
+    layer = canvas.Canvas(overlay, pagesize=(width, height))
+    for field in template.layout:
+        x, y = float(field["x"]) * width, float(field["y"]) * height
+        w, h = float(field.get("width", .25)) * width, float(field.get("height", .08)) * height
+        if field["key"] == "qr":
+            layer.drawImage(ImageReader(qr_path), x, height - y - h, width=w, height=h, mask="auto")
+            continue
+        layer.setFont("Helvetica-Bold" if field.get("bold") else "Helvetica", float(field.get("font_size", 18)))
+        layer.setFillColor(field.get("color", "#111111"))
+        text = _value_for(field, credential)
+        draw_y = height - y - h / 2
+        if field.get("align") == "center":
+            layer.drawCentredString(x + w / 2, draw_y, text)
+        elif field.get("align") == "right":
+            layer.drawRightString(x + w, draw_y, text)
+        else:
+            layer.drawString(x, draw_y, text)
+    layer.save()
+    overlay.seek(0)
+    artwork = template_path(template.artwork_key)
+    writer = PdfWriter()
+    if template.artwork_mime == "application/pdf":
+        background = PdfReader(str(artwork)).pages[0]
+    else:
+        image_pdf = BytesIO()
+        base = canvas.Canvas(image_pdf, pagesize=(width, height))
+        base.drawImage(ImageReader(str(artwork)), 0, 0, width=width, height=height, mask="auto")
+        base.save()
+        image_pdf.seek(0)
+        background = PdfReader(image_pdf).pages[0]
+    background.merge_page(PdfReader(overlay).pages[0])
+    writer.add_page(background)
+    result = BytesIO()
+    writer.write(result)
+    return result.getvalue()

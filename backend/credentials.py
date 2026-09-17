@@ -4,20 +4,16 @@ import uuid
 from .crypto import calculate_hash, sign_data
 
 
-def create_credential(
-    name: str,
-    qualification: str,
-    graduation_year: int,
-    cgpa: float,
-    issuer: str = "ABC Institute of Technology",
-):
+def create_credential(*, club_id: int, club_name: str, event_id: int, event_name: str,
+                      template_version_id: int, issued_by: str, recipient_values: dict):
     credential = {
         "credential_id": f"VC-{date.today().year}-{uuid.uuid4().hex[:8].upper()}",
-        "issuer": issuer,
-        "name": name,
-        "qualification": qualification,
-        "graduation_year": graduation_year,
-        "cgpa": cgpa,
+        "issuer": "VeriCert",
+        "club": {"id": club_id, "name": club_name},
+        "event": {"id": event_id, "name": event_name},
+        "template_version_id": template_version_id,
+        "issued_by": issued_by,
+        "recipient": recipient_values,
         "issue_date": date.today().isoformat(),
     }
 
