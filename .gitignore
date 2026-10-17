@@ -4,3 +4,4 @@ generated/
 frontend/dist/
 __pycache__/
 *.pyc
+*.env

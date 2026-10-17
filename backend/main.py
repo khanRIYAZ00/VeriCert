@@ -1,37 +1,115 @@
 import csv
 import io
 import os
+import secrets
+import hashlib
+import logging
 import smtplib
-from datetime import datetime
+import ssl
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from pathlib import Path
 
-from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, UploadFile
+from dotenv import load_dotenv
+load_dotenv()
+
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from .auth import create_token, get_current_user, get_db, hash_password, require_club_access, verify_password
+from .auth import (
+    create_token,
+    get_authenticated_user,
+    get_current_user,
+    get_db,
+    get_platform_admin,
+    hash_password,
+    require_club_access,
+    validate_auth_configuration,
+    verify_password,
+)
 from .certificate import render_certificate
 from .credentials import create_credential
 from .crypto import calculate_hash, generate_keys, verify_signature
 from .database import init_database
-from .models import Club, DeliveryAttempt, Event, Issuance, Membership, TemplateVersion, User
+from .models import (
+    Club,
+    DeliveryAttempt,
+    Event,
+    Issuance,
+    Membership,
+    PasswordResetToken,
+    SecurityAuditLog,
+    TemplateVersion,
+    User,
+)
 from .qr import generate_qr
-from .storage import save_template_artwork, template_path
+from .storage import save_template_artwork
+from .rate_limit import rate_limiter
 
-app = FastAPI(title="VeriCert", description="Verifiable multi-tenant certificates", version="1.0.0")
+
+@asynccontextmanager
+async def app_lifespan(_: FastAPI):
+    validate_auth_configuration()
+    is_production = os.getenv("VERICERT_ENV", "development").strip().lower() == "production"
+    if is_production:
+        if not os.getenv("VERICERT_FRONTEND_URL", "").startswith("https://"):
+            raise RuntimeError("VERICERT_FRONTEND_URL must use HTTPS in production")
+        if not smtp_enabled() or os.getenv("VERICERT_SMTP_TLS", "true").strip().lower() != "true":
+            raise RuntimeError("Production password recovery requires SMTP with TLS")
+    generate_keys()
+    init_database()
+    await rate_limiter.initialize()
+    try:
+        yield
+    finally:
+        await rate_limiter.close()
+
+
+app = FastAPI(
+    title="VeriCert",
+    description="Verifiable multi-tenant certificates",
+    version="1.0.0",
+    lifespan=app_lifespan,
+)
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 Path("storage/templates").mkdir(parents=True, exist_ok=True)
 app.mount("/assets/templates", StaticFiles(directory="storage/templates"), name="templates")
 
 
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
 class LoginRequest(BaseModel):
-    email: str
-    password: str
+    email: str = Field(min_length=3, max_length=255)
+    password: str = Field(min_length=1, max_length=128)
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str = Field(min_length=1, max_length=128)
+    new_password: str = Field(min_length=12, max_length=128)
+
+
+class ForgotPasswordRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=255)
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str = Field(min_length=32, max_length=256)
+    new_password: str = Field(min_length=12, max_length=128)
+
+
+class ProvisionStudentRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=255)
+    roll_number: str = Field(min_length=1, max_length=128)
+    email_verified: bool = False
 
 
 class ClubRequest(BaseModel):
@@ -44,8 +122,8 @@ class EventRequest(BaseModel):
 
 
 class MemberRequest(BaseModel):
-    email: str
-    password: str = Field(min_length=10)
+    email: str = Field(min_length=3, max_length=255)
+    password: str = Field(min_length=12, max_length=128)
 
 
 class TemplateUpdate(BaseModel):
@@ -127,6 +205,71 @@ def smtp_enabled() -> bool:
     return bool(os.getenv("VERICERT_SMTP_HOST"))
 
 
+def normalized_email(value: str) -> str:
+    email = value.strip().lower()
+    if (
+        len(email) > 255
+        or email.count("@") != 1
+        or any(character.isspace() for character in email)
+        or "." not in email.rsplit("@", 1)[1]
+    ):
+        raise HTTPException(status_code=422, detail="Enter a valid email address")
+    return email
+
+
+def user_payload(user: User) -> dict:
+    role = "platform_admin" if user.is_platform_admin else user.role
+    return {
+        "id": user.id,
+        "email": user.email,
+        "role": role,
+        "platform_admin": user.is_platform_admin,
+        "roll_number": user.roll_number,
+        "email_verified": user.email_verified,
+        "must_change_password": user.must_change_password,
+    }
+
+
+def audit_security_event(
+    db: Session,
+    action: str,
+    actor_user_id: int | None = None,
+    subject_user_id: int | None = None,
+) -> None:
+    db.add(
+        SecurityAuditLog(
+            action=action,
+            actor_user_id=actor_user_id,
+            subject_user_id=subject_user_id,
+        )
+    )
+
+
+def send_password_reset_email(email: str, token: str) -> None:
+    host = os.getenv("VERICERT_SMTP_HOST")
+    frontend_url = os.getenv("VERICERT_FRONTEND_URL", "http://127.0.0.1:5173")
+    if not host:
+        raise RuntimeError("Password recovery email is not configured")
+
+    message = EmailMessage()
+    message["Subject"] = "Reset your VeriCert password"
+    message["From"] = os.getenv("VERICERT_SMTP_FROM", "certificates@vericert.local")
+    message["To"] = email
+    message.set_content(
+        "Use the following link to reset your VeriCert password. "
+        "The link expires in 30 minutes and can only be used once:\n\n"
+        f"{frontend_url.rstrip('/')}/reset-password?token={token}\n"
+    )
+    port = int(os.getenv("VERICERT_SMTP_PORT", "587"))
+    with smtplib.SMTP(host, port, timeout=10) as smtp:
+        if os.getenv("VERICERT_SMTP_TLS", "true").strip().lower() == "true":
+            smtp.starttls(context=ssl.create_default_context())
+        smtp_user = os.getenv("VERICERT_SMTP_USER")
+        if smtp_user:
+            smtp.login(smtp_user, os.getenv("VERICERT_SMTP_PASSWORD", ""))
+        smtp.send_message(message)
+
+
 def create_issuance(payload: IssueRequest, user: User, db: Session) -> Issuance:
     event, club, template = get_event_for_user(payload.event_id, user, db)
     roll_number = payload.roll_number.strip()
@@ -150,27 +293,224 @@ def create_issuance(payload: IssueRequest, user: User, db: Session) -> Issuance:
     return issuance
 
 
-@app.on_event("startup")
-def startup():
-    generate_keys()
-    init_database()
-    db = next(get_db())
-    if not db.query(User).filter_by(email="admin@vericert.local").first():
-        db.add(User(email="admin@vericert.local", password_hash=hash_password("change-me"), is_platform_admin=True))
-        db.commit()
-    db.close()
-
-
 @app.get("/")
 def root(): return {"project": "VeriCert", "version": "1.0.0", "status": "running"}
 
 
 @app.post("/auth/login")
-def login(request: LoginRequest, db: Session = Depends(get_db)):
-    user = db.query(User).filter_by(email=request.email.lower()).first()
-    if not user or not verify_password(request.password, user.password_hash):
+async def login(request: LoginRequest, http_request: Request, db: Session = Depends(get_db)):
+    email = normalized_email(request.email)
+    await rate_limiter.check(http_request, "login", email)
+    user = db.query(User).filter_by(email=email).first()
+    if not user or not await run_in_threadpool(verify_password, request.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Invalid email or password")
-    return {"token": create_token(user), "user": {"id": user.id, "email": user.email, "platform_admin": user.is_platform_admin}}
+    if not user.is_active:
+        raise HTTPException(status_code=403, detail="This account is inactive")
+    return {"token": create_token(user), "user": user_payload(user)}
+
+
+@app.post("/auth/change-password")
+def change_password(
+    request: ChangePasswordRequest,
+    user: User = Depends(get_authenticated_user),
+    db: Session = Depends(get_db),
+):
+    if not verify_password(request.current_password, user.password_hash):
+        raise HTTPException(status_code=401, detail="Current password is incorrect")
+    if request.current_password == request.new_password:
+        raise HTTPException(status_code=422, detail="Choose a different password")
+
+    user.password_hash = hash_password(request.new_password)
+    user.must_change_password = False
+    user.password_changed_at = datetime.utcnow()
+    user.token_version += 1
+    audit_security_event(db, "password_changed", user.id, user.id)
+    db.commit()
+    return {"message": "Password changed. Sign in again with your new password."}
+
+
+@app.post("/auth/forgot-password")
+async def forgot_password(
+    request: ForgotPasswordRequest,
+    http_request: Request,
+    db: Session = Depends(get_db),
+):
+    email = normalized_email(request.email)
+    await rate_limiter.check(http_request, "forgot-password", email, limit=3)
+    generic_response = {"message": "If an active account exists, password reset instructions will be sent."}
+    if not smtp_enabled():
+        raise HTTPException(status_code=503, detail="Password recovery is currently unavailable")
+
+    user = db.query(User).filter_by(email=email, is_active=True, email_verified=True).first()
+    if not user:
+        return generic_response
+
+    now = utc_now()
+    db.query(PasswordResetToken).filter(
+        PasswordResetToken.user_id == user.id,
+        PasswordResetToken.used_at.is_(None),
+        PasswordResetToken.revoked_at.is_(None),
+    ).update({PasswordResetToken.revoked_at: now}, synchronize_session=False)
+    token = secrets.token_urlsafe(32)
+    reset_record = PasswordResetToken(
+        user_id=user.id,
+        token_hash=hashlib.sha256(token.encode("utf-8")).hexdigest(),
+        expires_at=now + timedelta(minutes=30),
+    )
+    db.add(reset_record)
+    audit_security_event(db, "password_reset_requested", subject_user_id=user.id)
+    db.commit()
+    try:
+        await run_in_threadpool(send_password_reset_email, user.email, token)
+    except (OSError, smtplib.SMTPException, RuntimeError, ValueError):
+        reset_record.revoked_at = utc_now()
+        db.commit()
+        logging.getLogger(__name__).error("Password reset email delivery failed; reset token revoked")
+    return generic_response
+
+
+@app.post("/auth/reset-password")
+async def reset_password(
+    request: ResetPasswordRequest,
+    http_request: Request,
+    db: Session = Depends(get_db),
+):
+    await rate_limiter.check(http_request, "reset-password", request.token, limit=5)
+    token_hash = hashlib.sha256(request.token.encode("utf-8")).hexdigest()
+    now = utc_now()
+    try:
+        consumed = (
+            db.query(PasswordResetToken)
+            .filter(
+                PasswordResetToken.token_hash == token_hash,
+                PasswordResetToken.used_at.is_(None),
+                PasswordResetToken.revoked_at.is_(None),
+                PasswordResetToken.expires_at > now,
+            )
+            .update({PasswordResetToken.used_at: now}, synchronize_session=False)
+        )
+        if consumed != 1:
+            db.rollback()
+            raise HTTPException(status_code=400, detail="Reset link is invalid or expired")
+
+        token_record = db.query(PasswordResetToken).filter_by(token_hash=token_hash).one()
+        user = db.get(User, token_record.user_id)
+        if not user or not user.is_active:
+            db.rollback()
+            raise HTTPException(status_code=400, detail="Reset link is invalid or expired")
+
+        user.password_hash = await run_in_threadpool(hash_password, request.new_password)
+        user.password_changed_at = now
+        user.must_change_password = False
+        user.token_version += 1
+        db.query(PasswordResetToken).filter(
+            PasswordResetToken.user_id == user.id,
+            PasswordResetToken.id != token_record.id,
+            PasswordResetToken.used_at.is_(None),
+            PasswordResetToken.revoked_at.is_(None),
+        ).update({PasswordResetToken.revoked_at: now}, synchronize_session=False)
+        audit_security_event(db, "password_reset_completed", subject_user_id=user.id)
+        db.commit()
+    except HTTPException:
+        raise
+    except Exception:
+        db.rollback()
+        raise
+
+    return {"message": "Password reset. Sign in with your new password."}
+
+
+@app.get("/admin/students")
+def list_students(user: User = Depends(get_platform_admin), db: Session = Depends(get_db)):
+    students = db.query(User).filter_by(role="student", is_platform_admin=False).order_by(User.email).all()
+    return [
+        {
+            "id": student.id,
+            "email": student.email,
+            "roll_number": student.roll_number,
+            "is_active": student.is_active,
+            "email_verified": student.email_verified,
+            "must_change_password": student.must_change_password,
+        }
+        for student in students
+    ]
+
+
+@app.post("/admin/students")
+async def provision_student(
+    request: ProvisionStudentRequest,
+    http_request: Request,
+    actor: User = Depends(get_platform_admin),
+    db: Session = Depends(get_db),
+):
+    email = normalized_email(request.email)
+    await rate_limiter.check(http_request, "student-provision", email, limit=10, window=3600)
+    roll_number = request.roll_number.strip().upper()
+    if len(roll_number) > 128 or not roll_number:
+        raise HTTPException(status_code=422, detail="Enter a valid student identifier")
+    if db.query(User.id).filter_by(email=email).first():
+        raise HTTPException(status_code=409, detail="An account with this email already exists")
+    if db.query(User.id).filter(func.lower(User.roll_number) == roll_number.lower()).first():
+        raise HTTPException(status_code=409, detail="An account with this student identifier already exists")
+
+    temporary_password = secrets.token_urlsafe(32)
+    student = User(
+        email=email,
+        roll_number=roll_number,
+        password_hash=await run_in_threadpool(hash_password, temporary_password),
+        role="student",
+        is_active=True,
+        email_verified=request.email_verified,
+        must_change_password=True,
+        password_changed_at=utc_now(),
+    )
+    db.add(student)
+    db.flush()
+    audit_security_event(db, "student_account_created", actor.id, student.id)
+    if student.email_verified:
+        audit_security_event(db, "student_email_verified_by_admin", actor.id, student.id)
+    db.commit()
+    return {
+        "student": {
+            "id": student.id,
+            "email": student.email,
+            "roll_number": student.roll_number,
+            "must_change_password": True,
+        },
+        "temporary_password": temporary_password,
+    }
+
+
+@app.post("/admin/students/{student_id}/verify-email")
+def verify_student_email(
+    student_id: int,
+    actor: User = Depends(get_platform_admin),
+    db: Session = Depends(get_db),
+):
+    student = db.get(User, student_id)
+    if not student or student.is_platform_admin or student.role != "student":
+        raise HTTPException(status_code=404, detail="Student account not found")
+    if not student.email_verified:
+        student.email_verified = True
+        audit_security_event(db, "student_email_verified_by_admin", actor.id, student.id)
+        db.commit()
+    return {"message": "Student email verified"}
+
+
+@app.post("/admin/students/{student_id}/deactivate")
+def deactivate_student(
+    student_id: int,
+    actor: User = Depends(get_platform_admin),
+    db: Session = Depends(get_db),
+):
+    student = db.get(User, student_id)
+    if not student or student.is_platform_admin:
+        raise HTTPException(status_code=404, detail="Student account not found")
+    student.is_active = False
+    student.token_version += 1
+    audit_security_event(db, "student_account_deactivated", actor.id, student.id)
+    db.commit()
+    return {"message": "Student account deactivated"}
 
 
 @app.get("/clubs")
@@ -181,8 +521,10 @@ def list_clubs(user: User = Depends(get_current_user), db: Session = Depends(get
 
 
 @app.post("/clubs")
-def create_club(request: ClubRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def create_club(request: ClubRequest, user: User = Depends(get_platform_admin), db: Session = Depends(get_db)):
     club = Club(name=request.name)
+    if not user.is_platform_admin:
+        user.role = "club_admin"
     db.add(club); db.flush(); db.add(Membership(user_id=user.id, club_id=club.id, role="admin")); db.commit()
     return {"id": club.id, "name": club.name}
 
@@ -206,12 +548,22 @@ def create_event(club_id: int, request: EventRequest, user: User = Depends(get_c
 @app.post("/clubs/{club_id}/members")
 def add_member(club_id: int, request: MemberRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     require_club_access(club_id, user, db)
-    member_user = db.query(User).filter_by(email=request.email.lower()).first()
+    email = normalized_email(request.email)
+    member_user = db.query(User).filter_by(email=email).first()
     if not member_user:
-        member_user = User(email=request.email.lower(), password_hash=hash_password(request.password))
+        member_user = User(
+            email=email,
+            password_hash=hash_password(request.password),
+            role="club_admin",
+            must_change_password=True,
+            password_changed_at=utc_now(),
+        )
         db.add(member_user); db.flush()
+    if not member_user.is_platform_admin:
+        member_user.role = "club_admin"
     if not db.query(Membership).filter_by(user_id=member_user.id, club_id=club_id).first():
-        db.add(Membership(user_id=member_user.id, club_id=club_id, role="admin")); db.commit()
+        db.add(Membership(user_id=member_user.id, club_id=club_id, role="admin"))
+    db.commit()
     return {"id": member_user.id, "email": member_user.email}
 
 
@@ -322,29 +674,44 @@ def regenerate_certificate(issuance_id: int, user: User = Depends(get_current_us
 
 
 @app.get("/certificates/download")
-def download_by_roll_number(roll_no: str, db: Session = Depends(get_db)):
-    """Return public certificate choices for a roll number."""
-    normalized_roll_number = roll_no.strip()
+def download_by_roll_number(roll_no: str | None = None, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Return certificate choices for the authenticated student only."""
+    if user.is_platform_admin:
+        if not roll_no or not roll_no.strip():
+            raise HTTPException(status_code=400, detail="roll_no is required for admins")
+        normalized_roll_number = roll_no.strip()
+    else:
+        if not user.roll_number:
+            raise HTTPException(status_code=403, detail="This student account is not assigned a roll number")
+        normalized_roll_number = user.roll_number.strip()
+        if roll_no and roll_no.strip().lower() != normalized_roll_number.lower():
+            raise HTTPException(status_code=403, detail="You can only access your own certificates")
+
     issuances = db.query(Issuance).filter(func.lower(Issuance.roll_number) == normalized_roll_number.lower()).order_by(Issuance.created_at.desc()).all()
-    if not issuances:
-        raise HTTPException(404, "No certificate was found for that roll number")
     return [{
         "id": issuance.id,
         "credential_id": issuance.credential_id,
-        "event": db.get(Event, issuance.event_id).name,
-        "club": db.get(Club, issuance.club_id).name,
-        "issue_date": issuance.credential_package["credential"]["issue_date"],
+        "event": (db.get(Event, issuance.event_id).name if db.get(Event, issuance.event_id) else "Unknown event"),
+        "club": (db.get(Club, issuance.club_id).name if db.get(Club, issuance.club_id) else "Unknown club"),
+        "issue_date": ((issuance.credential_package or {}).get("credential") or {}).get("issue_date"),
         "status": issuance.status,
     } for issuance in issuances]
 
 
 @app.get("/certificates/{issuance_id}/download")
-def download_selected_certificate(issuance_id: int, db: Session = Depends(get_db)):
+def download_selected_certificate(issuance_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     issuance = db.get(Issuance, issuance_id)
     if not issuance:
         raise HTTPException(404, "Certificate not found")
-    pdf = render_certificate(db.get(TemplateVersion, issuance.template_version_id), issuance.credential_package,
-                             generate_qr(issuance.credential_id))
+    if not user.is_platform_admin:
+        if not user.roll_number:
+            raise HTTPException(status_code=403, detail="This student account is not assigned a roll number")
+        if issuance.roll_number.lower() != user.roll_number.lower():
+            raise HTTPException(status_code=403, detail="You can only access your own certificates")
+    template = db.get(TemplateVersion, issuance.template_version_id)
+    if not template:
+        raise HTTPException(404, "Certificate template not found")
+    pdf = render_certificate(template, issuance.credential_package, generate_qr(issuance.credential_id))
     return Response(pdf, media_type="application/pdf", headers={"Content-Disposition": f'attachment; filename="{issuance.credential_id}.pdf"'})
 
 

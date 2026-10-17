@@ -1,7 +1,9 @@
 import os
 from pathlib import Path
 
-from sqlalchemy import create_engine, inspect, text
+from alembic import command
+from alembic.config import Config
+from sqlalchemy import create_engine
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 
@@ -16,18 +18,6 @@ class Base(DeclarativeBase):
 
 
 def init_database() -> None:
-    Path("storage/templates").mkdir(parents=True, exist_ok=True)
-    Base.metadata.create_all(bind=engine)
-    # `create_all` does not alter an existing SQLite database. Keep this small
-    # migration here so installations made before roll-number downloads continue
-    # to work without a manual database reset.
-    inspector = inspect(engine)
-    columns = {column["name"] for column in inspector.get_columns("issuances")}
-    with engine.begin() as connection:
-        if "roll_number" not in columns:
-            connection.execute(text("ALTER TABLE issuances ADD COLUMN roll_number VARCHAR(128)"))
-        indexes = inspect(connection).get_indexes("issuances")
-        for index in indexes:
-            if index.get("column_names") == ["roll_number"]:
-                connection.execute(text(f'DROP INDEX IF EXISTS "{index["name"]}"'))
-        connection.execute(text("CREATE INDEX IF NOT EXISTS ix_issuances_roll_number ON issuances (roll_number)"))
+    config = Config(str(Path(__file__).resolve().parent.parent / "alembic.ini"))
+    config.set_main_option("sqlalchemy.url", DATABASE_URL.replace("%", "%%"))
+    command.upgrade(config, "head")
